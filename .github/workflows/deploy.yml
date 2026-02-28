@@ -1,56 +1,33 @@
-name: 🚀 Build & Deploy to Production
+name: 🛠️ Build Docker Image
 
+# ========================================
+# 触发条件：
+# - main 分支推送 → latest 标签
+# - develop 分支推送 → develop 标签  
+# - tag 推送 (v*) → 对应版本标签
+# ========================================
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
+    tags: ['v*']
 
-# ========================================
-# 🔧 项目配置变量（复用到其他项目时只需修改这里）
-# ========================================
 env:
-  # 项目基本信息
-  PROJECT_NAME: portal-task-web # 项目名称（用于资源命名）
-  GITHUB_REPO: tt472625987/portal-task-web # GitHub 仓库地址
-
-  # 阿里云容器镜像服务配置
-  ACR_REGION: cn-chengdu # 阿里云地区
-  ACR_NAMESPACE: ray321 # 阿里云 ACR 命名空间
-  ACR_REGISTRY_VPC: registry-vpc.cn-chengdu.aliyuncs.com # VPC 内网地址（推送用）
-  ACR_REGISTRY_PUBLIC: registry.cn-chengdu.aliyuncs.com # 公网地址（K8s 拉取用）
-
-  # Kubernetes 配置
-  K8S_NAMESPACE: default # K8s 命名空间
-  K8S_DEPLOYMENT_FILE: deployment.yaml # K8s 部署文件名
-
-  # 健康检查配置
-  HEALTH_CHECK_PATH: /api/health # 健康检查路径
-  CONTAINER_PORT: 3000 # 容器端口
-
-  # 部署超时时间（秒）
-  ROLLOUT_TIMEOUT: 180
+  PROJECT_NAME: portal-task-web
+  ACR_REGISTRY_VPC: registry-vpc.cn-chengdu.aliyuncs.com
+  ACR_REGISTRY_PUBLIC: registry.cn-chengdu.aliyuncs.com
+  ACR_NAMESPACE: ray321
 
 jobs:
-  # =============================
-  # 1️⃣ 构建镜像并推送到腾讯 TCR
-  # =============================
   build:
-    name: 🏗️ Build & Push Docker Image
+    name: 🛠️ Build & Push Docker Image
     runs-on: [self-hosted, linux, x64]
 
-    outputs:
-      image: ${{ steps.meta.outputs.image }}
-      tag: ${{ steps.meta.outputs.tag }}
-
     steps:
-      # 拉取仓库代码
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          repository: ${{ env.GITHUB_REPO }}
-          fetch-depth: 0
           ssh-key: ${{ secrets.SSH_PRIVATE_KEY || '' }}
 
-      # 缓存 Node 模块，加快 yarn install
       - name: Cache Node modules
         uses: actions/cache@v3
         with:
@@ -59,169 +36,55 @@ jobs:
             ~/.cache/yarn
           key: ${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}
 
-      # 登录阿里云容器镜像服务 ACR（VPC 内网地址，用于推送）
-      - name: Login to Alibaba Cloud Container Registry (VPC)
+      - name: Login to Alibaba Cloud ACR (VPC)
         uses: docker/login-action@v3
         with:
           registry: ${{ env.ACR_REGISTRY_VPC }}
           username: ${{ secrets.ALICLOUD_USERNAME }}
           password: ${{ secrets.ALICLOUD_PASSWORD }}
 
-      # 生成镜像标签（构建号 + commit 短码）
-      - name: Generate image metadata
+      # 根据分支/tag 生成镜像标签
+      - name: Generate image tag
         id: meta
         run: |
-          # VPC 内网地址（用于推送，速度快且免流量费）
           VPC_IMAGE=${{ env.ACR_REGISTRY_VPC }}/${{ env.ACR_NAMESPACE }}/${{ env.PROJECT_NAME }}
-          # 公网地址（用于 K8s 拉取，VPC和公网指向同一个镜像仓库）
           PUBLIC_IMAGE=${{ env.ACR_REGISTRY_PUBLIC }}/${{ env.ACR_NAMESPACE }}/${{ env.PROJECT_NAME }}
-
-          # 镜像标签：build-构建号-commit短码
-          # 例如：build-123-abc1234
-          IMAGE_TAG="build-${GITHUB_RUN_NUMBER}-$(git rev-parse --short HEAD)"
-
-          # 输出给后续步骤
-          echo "image=$PUBLIC_IMAGE" >> $GITHUB_OUTPUT
-          echo "tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            IMAGE_TAG=${GITHUB_REF#refs/tags/v}
+          elif [[ "$GITHUB_REF" == refs/heads/main ]]; then
+            IMAGE_TAG=latest
+          elif [[ "$GITHUB_REF" == refs/heads/develop ]]; then
+            IMAGE_TAG=develop
+          else
+            IMAGE_TAG=${GITHUB_REF#refs/heads/}
+          fi
+          
           echo "vpc_image=$VPC_IMAGE" >> $GITHUB_OUTPUT
+          echo "public_image=$PUBLIC_IMAGE" >> $GITHUB_OUTPUT
+          echo "tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "🏷️ 镜像: $PUBLIC_IMAGE:$IMAGE_TAG"
 
-          echo "🏷️  镜像标签: $IMAGE_TAG"
-          echo "📤 推送地址: $VPC_IMAGE:$IMAGE_TAG"
-          echo "📦 拉取地址: $PUBLIC_IMAGE:$IMAGE_TAG"
-
-      # 构建并推送镜像（使用 VPC 内网推送，速度更快）
       - name: Build & Push Docker Image
         run: |
           VPC_IMAGE=${{ steps.meta.outputs.vpc_image }}
-          PUBLIC_IMAGE=${{ steps.meta.outputs.image }}
+          PUBLIC_IMAGE=${{ steps.meta.outputs.public_image }}
           IMAGE_TAG=${{ steps.meta.outputs.tag }}
 
-          echo "🛠 构建镜像: $VPC_IMAGE:$IMAGE_TAG"
-
-          # 构建镜像（只 tag VPC 地址）
           docker build \
             --build-arg DATABASE_URL=${{ secrets.SUPABASE_POSTGRES_DATABASE_URL }} \
             --build-arg DIRECT_URL=${{ secrets.SUPABASE_POSTGRES_DIRECT_URL }} \
             -t $VPC_IMAGE:$IMAGE_TAG .
 
-          echo "📤 推送镜像到阿里云 ACR (VPC 内网，速度快且免流量费)..."
           docker push $VPC_IMAGE:$IMAGE_TAG
-
-          echo "✅ 镜像推送成功"
-          echo "   🚀 推送地址: $VPC_IMAGE:$IMAGE_TAG"
-          echo "   📦 K8s拉取地址: $PUBLIC_IMAGE:$IMAGE_TAG"
-          echo "   💡 提示: VPC和公网地址指向同一个镜像，推送到VPC后可通过公网访问"
-
-          # 输出给后续步骤
-          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
-          echo "IMAGE=$PUBLIC_IMAGE" >> $GITHUB_ENV
-
-  # =============================
-  # 2️⃣ 部署到 Kubernetes 集群
-  # =============================
-  deploy:
-    name: 🚀 Deploy to Kubernetes
-    runs-on: [self-hosted, linux, x64]
-    needs: build
-    environment: production
-
-    steps:
-      # 拉取仓库代码
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.GITHUB_REPO }}
-          fetch-depth: 0
-          ssh-key: ${{ secrets.SSH_PRIVATE_KEY || '' }}
-
-      # 配置 K8s 访问
-      - name: Configure cluster access
-        env:
-          KUBECONFIG_CONTENT: ${{ secrets.KUBECONFIG }}
-        run: |
-          mkdir -p $HOME/.kube
-          echo "$KUBECONFIG_CONTENT" > $HOME/.kube/config
-          chmod 600 $HOME/.kube/config
-          # 设置环境变量，使其在后续所有步骤中生效
-          echo "KUBECONFIG=$HOME/.kube/config" >> $GITHUB_ENV
-
-          # 显示集群 API 地址
-          echo "📍 集群 API 地址："
-          kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}'
-          echo ""
-
-          # 验证集群连接
-          echo "🔍 验证集群连接..."
-          kubectl cluster-info --request-timeout=10s
-          echo "✅ K8s 集群连接成功"
-
-      # 同步应用 Secrets 到 Kubernetes
-      - name: Sync Application Secrets to Kubernetes
-        run: |
-          cat <<EOF | kubectl apply -f -
-          apiVersion: v1
-          kind: Secret
-          metadata:
-            name: supabase-secret-${{ env.PROJECT_NAME }}
-            namespace: ${{ env.K8S_NAMESPACE }}
-          type: Opaque
-          stringData:
-            DATABASE_URL: "${{ secrets.SUPABASE_POSTGRES_DATABASE_URL }}"
-            DIRECT_URL: "${{ secrets.SUPABASE_POSTGRES_DIRECT_URL }}"
-          EOF
-          echo "✅ 应用 Secrets 已同步"
-
-      # 创建阿里云镜像拉取凭证（让腾讯云 K8s 能拉取阿里云 ACR 镜像）
-      - name: Create Alibaba Cloud ACR Pull Secret
-        run: |
-          # 删除旧的 secret（如果存在）
-          kubectl delete secret aliyun-acr-secret -n ${{ env.K8S_NAMESPACE }} --ignore-not-found=true
-
-          # 创建新的 docker-registry secret
-          kubectl create secret docker-registry aliyun-acr-secret \
-            --docker-server=${{ env.ACR_REGISTRY_PUBLIC }} \
-            --docker-username="${{ secrets.ALICLOUD_USERNAME }}" \
-            --docker-password="${{ secrets.ALICLOUD_PASSWORD }}" \
-            --namespace=${{ env.K8S_NAMESPACE }}
-
-          echo "✅ 阿里云镜像拉取凭证已创建"
-
-      # 替换镜像并部署
-      - name: Apply deployment
-        run: |
-          IMAGE=${{ needs.build.outputs.image }}
-          TAG=${{ needs.build.outputs.tag }}
-
-          sed -i "s|__IMAGE_NAME__|$IMAGE|g" ${{ env.K8S_DEPLOYMENT_FILE }}
-          sed -i "s|__IMAGE_TAG__|$TAG|g" ${{ env.K8S_DEPLOYMENT_FILE }}
-
-          echo "🚀 部署版本: $IMAGE:$TAG"
-          kubectl apply -f ${{ env.K8S_DEPLOYMENT_FILE }}
-
-      # 检查部署状态并自动回滚（防止坏版本）
-      - name: Verify rollout & rollback if failed
-        run: |
-          DEPLOY_NAME=${{ env.PROJECT_NAME }}-deployment
-          set -e
-          if kubectl rollout status deployment/$DEPLOY_NAME --timeout=${{ env.ROLLOUT_TIMEOUT }}s; then
-            echo "✅ 部署成功"
-          else
-            echo "❌ 部署失败，开始回滚..."
-            kubectl rollout undo deployment/$DEPLOY_NAME
-            echo "🩹 已回滚到上一个稳定版本"
-            exit 1
-          fi
-
-      # 部署完成通知（可选）
-      - name: Notify Deployment Result
-        if: always()
-        run: |
-          STATUS=${{ job.status }}
-          IMAGE=${{ needs.build.outputs.image }}
-          TAG=${{ needs.build.outputs.tag }}
-          echo "📢 部署状态: $STATUS"
-          echo "📦 镜像: $IMAGE:$TAG"
+          echo "✅ 镜像推送成功: $PUBLIC_IMAGE:$IMAGE_TAG"
 
       - name: Clean Docker BuildKit cache
+        run: docker builder prune -af
+
+      - name: Summary
         run: |
-          docker builder prune -af
+          echo "✅ 镜像构建完成"
+          echo "📦 ${{ steps.meta.outputs.public_image }}:${{ steps.meta.outputs.tag }}"
+          echo ""
+          echo "在 Kuboard 中手动更新镜像版本即可部署"
