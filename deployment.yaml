@@ -32,7 +32,7 @@ spec:
         app: portal-task-web
     spec:
       imagePullSecrets:
-        - name: aliyun-acr-secret
+        - name: tencent-tcr-secret
       containers:
         - name: portal-task-web
           image: __IMAGE_NAME__:__IMAGE_TAG__
